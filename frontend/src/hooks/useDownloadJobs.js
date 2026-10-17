@@ -1,5 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { getDownloadJobs, createDownloadJob, deleteJobApi, createJobEventSource } from '../services/api';
+import {
+  getDownloadJobs,
+  createDownloadJob,
+  deleteJobApi,
+  cancelJobApi,
+  retryJobApi,
+  createJobEventSource,
+} from '../services/api';
 
 const ACTIVE_STATES = new Set(['queued', 'inspecting', 'downloading', 'processing', 'zipping']);
 const TERMINAL_STATES = new Set(['completed', 'completed_with_errors', 'failed', 'cancelled', 'expired']);
@@ -119,6 +126,24 @@ export function useDownloadJobs() {
     }
   };
 
+  const cancelJob = async (id) => {
+    try {
+      const updated = await cancelJobApi(id);
+      if (updated) mergeJob(updated);
+    } catch (err) {
+      setError(err.message || 'Failed to cancel job');
+    }
+  };
+
+  const retryJob = async (id) => {
+    try {
+      const updated = await retryJobApi(id);
+      if (updated) mergeJob(updated);
+    } catch (err) {
+      setError(err.message || 'Failed to retry job');
+    }
+  };
+
   return {
     jobs,
     loading,
@@ -126,5 +151,7 @@ export function useDownloadJobs() {
     refreshJobs: fetchJobs,
     createJob: addJob,
     removeJob,
+    cancelJob,
+    retryJob,
   };
 }

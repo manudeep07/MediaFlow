@@ -44,6 +44,8 @@ export default function App() {
     refreshJobs,
     createJob,
     removeJob,
+    cancelJob,
+    retryJob,
   } = useDownloadJobs();
 
   const fetchHealth = async () => {
@@ -204,6 +206,8 @@ export default function App() {
           <ActiveJobs
             jobs={jobs}
             onRemoveJob={removeJob}
+            onCancelJob={cancelJob}
+            onRetryJob={retryJob}
             onRefresh={refreshJobs}
             loading={jobLoading}
           />

@@ -48,6 +48,7 @@ export function convertAudio(inputPath, outputPath, options = {}) {
 
     const child = spawn(ffmpegPath, args, {
       windowsHide: true,
+      signal: options.signal,
     });
 
     const timeout = setTimeout(() => {
@@ -142,7 +143,7 @@ export function mergeVideoAndAudio(videoPath, audioPath, outputPath) {
   });
 }
 
-export function remuxToMp4(inputPath, outputPath) {
+export function remuxToMp4(inputPath, outputPath, options = {}) {
   const env = getEnv();
   const ffmpegPath = env.FFMPEG_PATH;
 
@@ -160,7 +161,7 @@ export function remuxToMp4(inputPath, outputPath) {
     let stderr = '';
     let exited = false;
 
-    const child = spawn(ffmpegPath, args, { windowsHide: true });
+    const child = spawn(ffmpegPath, args, { windowsHide: true, signal: options.signal });
 
     child.stderr.on('data', (d) => { stderr += d.toString(); });
 

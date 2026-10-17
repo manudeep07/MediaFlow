@@ -8,6 +8,8 @@ import {
   deleteDownloadHandler,
   getPlaylistItemsHandler,
   downloadArchiveHandler,
+  cancelDownloadHandler,
+  retryDownloadHandler,
 } from '../controllers/downloadsController.js';
 
 export const downloadsRouter = Router();
@@ -18,4 +20,7 @@ downloadsRouter.get('/downloads/:id', getDownloadStatusHandler);
 downloadsRouter.get('/downloads/:id/file', downloadFileHandler);
 downloadsRouter.get('/downloads/:id/items', getPlaylistItemsHandler);
 downloadsRouter.get('/downloads/:id/archive', downloadArchiveHandler);
+downloadsRouter.post('/downloads/:id/cancel', cancelDownloadHandler);
+downloadsRouter.post('/downloads/:id/retry', retryDownloadHandler);
 downloadsRouter.delete('/downloads/:id', deleteDownloadHandler);
+

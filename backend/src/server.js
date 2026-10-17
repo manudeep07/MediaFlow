@@ -1,14 +1,16 @@
 import { createApp } from './app.js';
 import { getEnv } from './config/env.js';
 import { initDatabase, closeDatabase } from './database/index.js';
+import { recoverInterruptedJobs } from './services/jobManager.js';
 import { logger } from './middleware/logger.js';
 
 const env = getEnv();
 
-// Initialize SQLite database
+// Initialize SQLite database and recover interrupted jobs
 try {
   initDatabase();
   logger.info({ dbPath: env.DB_PATH }, 'SQLite database connected and initialized');
+  recoverInterruptedJobs();
 } catch (err) {
   logger.fatal({ err }, 'Failed to initialize SQLite database');
   process.exit(1);

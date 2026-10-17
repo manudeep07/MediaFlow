@@ -48,5 +48,5 @@ describe('GET /api/health', () => {
     expect(res.body.configuration).toHaveProperty('maxPlaylistItems');
     expect(res.body.configuration).not.toHaveProperty('API_KEY');
     expect(res.body.configuration).not.toHaveProperty('apiKey');
-  });
+  }, 20000);
 });

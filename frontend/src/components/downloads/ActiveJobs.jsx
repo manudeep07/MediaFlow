@@ -2,7 +2,7 @@ import React from 'react';
 import { JobCard } from './JobCard';
 import { ListFilter, RefreshCw, Inbox } from 'lucide-react';
 
-export function ActiveJobs({ jobs = [], onRemoveJob, onRefresh, loading }) {
+export function ActiveJobs({ jobs = [], onRemoveJob, onCancelJob, onRetryJob, onRefresh, loading }) {
   if (jobs.length === 0) {
     return (
       <div className="bg-zinc-900/40 border border-zinc-800 rounded-2xl p-8 text-center text-zinc-500 flex flex-col items-center justify-center gap-2">
@@ -48,7 +48,13 @@ export function ActiveJobs({ jobs = [], onRemoveJob, onRefresh, loading }) {
 
       <div className="space-y-3">
         {jobs.map((job) => (
-          <JobCard key={job.id} job={job} onRemove={onRemoveJob} />
+          <JobCard
+            key={job.id}
+            job={job}
+            onRemove={onRemoveJob}
+            onCancel={onCancelJob}
+            onRetry={onRetryJob}
+          />
         ))}
       </div>
     </div>

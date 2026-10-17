@@ -6,6 +6,8 @@ import {
   getJob,
   listJobs,
   deleteJob,
+  cancelJob,
+  retryJob,
   processAudioJob,
   processVideoJob,
   processPlaylistAudioJob,
@@ -294,3 +296,85 @@ export async function downloadArchiveHandler(req, res) {
     }
   }
 }
+
+/**
+ * POST /api/downloads/:id/cancel
+ * Cancels an in-progress or queued download job.
+ */
+export async function cancelDownloadHandler(req, res) {
+  const { id } = req.params;
+  const job = getJob(id);
+
+  if (!job) {
+    return res.status(404).json({
+      success: false,
+      error: { code: 'JOB_NOT_FOUND', message: `Job ${id} not found` },
+    });
+  }
+
+  const nonCancellableStates = ['completed', 'completed_with_errors', 'failed', 'cancelled'];
+  if (nonCancellableStates.includes(job.state)) {
+    return res.status(400).json({
+      success: false,
+      error: {
+        code: 'INVALID_STATE',
+        message: `Cannot cancel job in '${job.state}' state`,
+      },
+    });
+  }
+
+  try {
+    const cancelledJob = await cancelJob(id);
+    return res.status(200).json({
+      success: true,
+      data: cancelledJob,
+    });
+  } catch (err) {
+    logger.error({ id, err: err.message }, 'Failed to cancel job');
+    return res.status(err.status || 500).json({
+      success: false,
+      error: { code: 'CANCEL_ERROR', message: err.message },
+    });
+  }
+}
+
+/**
+ * POST /api/downloads/:id/retry
+ * Retries a failed or cancelled job.
+ */
+export async function retryDownloadHandler(req, res) {
+  const { id } = req.params;
+  const job = getJob(id);
+
+  if (!job) {
+    return res.status(404).json({
+      success: false,
+      error: { code: 'JOB_NOT_FOUND', message: `Job ${id} not found` },
+    });
+  }
+
+  if (job.state !== 'failed' && job.state !== 'cancelled') {
+    return res.status(400).json({
+      success: false,
+      error: {
+        code: 'INVALID_STATE',
+        message: `Only failed or cancelled jobs can be retried (current state: '${job.state}')`,
+      },
+    });
+  }
+
+  try {
+    const retriedJob = await retryJob(id);
+    return res.status(200).json({
+      success: true,
+      data: retriedJob,
+    });
+  } catch (err) {
+    logger.error({ id, err: err.message }, 'Failed to retry job');
+    return res.status(err.status || 500).json({
+      success: false,
+      error: { code: 'RETRY_ERROR', message: err.message },
+    });
+  }
+}
+

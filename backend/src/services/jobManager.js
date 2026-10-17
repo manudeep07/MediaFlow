@@ -83,11 +83,143 @@ export function updateJob(id, fields = {}) {
   return updated;
 }
 
+const activeJobControllers = new Map();
+
 export async function deleteJob(id) {
   const db = getDatabase();
+  const controller = activeJobControllers.get(id);
+  if (controller) {
+    try { controller.abort(); } catch (e) {}
+    activeJobControllers.delete(id);
+  }
   await cleanupJobDirectory(id);
   db.prepare('DELETE FROM jobs WHERE id = ?').run(id);
   return { success: true, id };
+}
+
+export async function cancelJob(id) {
+  const job = getJob(id);
+  if (!job) {
+    const error = new Error(`Job ${id} not found`);
+    error.status = 404;
+    throw error;
+  }
+
+  const terminalStates = ['completed', 'completed_with_errors', 'failed', 'cancelled'];
+  if (terminalStates.includes(job.state)) {
+    const error = new Error(`Cannot cancel job in '${job.state}' state`);
+    error.status = 400;
+    throw error;
+  }
+
+  const controller = activeJobControllers.get(id);
+  if (controller) {
+    try { controller.abort(); } catch (e) {}
+    activeJobControllers.delete(id);
+  }
+
+  const cancelled = updateJob(id, {
+    state: 'cancelled',
+    error_message: 'Job cancelled by user',
+    speed: null,
+    eta: null,
+  });
+
+  logger.info({ id }, 'Job successfully cancelled by user');
+  return cancelled;
+}
+
+export async function retryJob(id) {
+  const job = getJob(id);
+  if (!job) {
+    const error = new Error(`Job ${id} not found`);
+    error.status = 404;
+    throw error;
+  }
+
+  if (job.state !== 'failed' && job.state !== 'cancelled') {
+    const error = new Error(`Only failed or cancelled jobs can be retried (current state: '${job.state}')`);
+    error.status = 400;
+    throw error;
+  }
+
+  updateJob(id, {
+    state: 'queued',
+    progress_percent: 0,
+    speed: null,
+    eta: null,
+    error_message: null,
+    output_filename: null,
+    output_path: null,
+    total_bytes: null,
+    completed_item_count: 0,
+    failed_item_count: 0,
+    current_item_index: 0,
+    completed_at: null,
+  });
+
+  if (job.scope === 'playlist') {
+    const db = getDatabase();
+    db.prepare(`
+      UPDATE playlist_items
+      SET state = 'pending',
+          progress_percent = 0,
+          error_message = null,
+          output_filename = null,
+          output_path = null,
+          updated_at = (datetime('now'))
+      WHERE job_id = ?
+    `).run(id);
+  }
+
+  if (job.scope === 'playlist') {
+    if (job.type === 'video') {
+      processPlaylistVideoJob(id).catch((err) => {
+        logger.error({ err: err.message, id }, 'Unhandled failure in retried playlist video job');
+      });
+    } else {
+      processPlaylistAudioJob(id).catch((err) => {
+        logger.error({ err: err.message, id }, 'Unhandled failure in retried playlist audio job');
+      });
+    }
+  } else {
+    if (job.type === 'video') {
+      processVideoJob(id).catch((err) => {
+        logger.error({ err: err.message, id }, 'Unhandled failure in retried single video job');
+      });
+    } else {
+      processAudioJob(id).catch((err) => {
+        logger.error({ err: err.message, id }, 'Unhandled failure in retried single audio job');
+      });
+    }
+  }
+
+  return getJob(id);
+}
+
+export function recoverInterruptedJobs() {
+  const db = getDatabase();
+  const stmt = db.prepare(`
+    SELECT id, state FROM jobs
+    WHERE state IN ('queued', 'inspecting', 'downloading', 'processing', 'zipping')
+  `);
+  const activeJobs = stmt.all();
+
+  if (activeJobs.length > 0) {
+    logger.info({ count: activeJobs.length }, 'Recovering interrupted jobs on startup');
+    const updateStmt = db.prepare(`
+      UPDATE jobs
+      SET state = 'failed',
+          error_message = 'Interrupted due to server restart',
+          updated_at = (datetime('now'))
+      WHERE id = ?
+    `);
+
+    for (const j of activeJobs) {
+      updateStmt.run(j.id);
+      logger.info({ jobId: j.id, previousState: j.state }, 'Marked interrupted job as failed');
+    }
+  }
 }
 
 // ─── Playlist Item Helpers ──────────────────────────────────────────────────
@@ -132,14 +264,17 @@ export async function processAudioJob(jobId) {
 
   logger.info({ jobId, url: job.url, format: job.format, quality: job.quality }, 'Processing audio job');
 
+  const controller = new AbortController();
+  activeJobControllers.set(jobId, controller);
+  const signal = controller.signal;
+
   try {
-    // 1. Create dedicated job directory
     const jobDir = await createJobDirectory(jobId);
 
-    // 2. Mark state as downloading
+    if (signal.aborted || getJob(jobId)?.state === 'cancelled') return;
+
     updateJob(jobId, { state: 'downloading', progress_percent: 5 });
 
-    // 3. Download source stream to temporary raw file
     const rawTemplate = path.join(jobDir, 'raw_source.%(ext)s');
     await downloadAudioStream(job.url, rawTemplate, (progress) => {
       if (progress.percent) {
@@ -149,9 +284,10 @@ export async function processAudioJob(jobId) {
           eta: progress.eta || null,
         });
       }
-    });
+    }, { signal });
 
-    // Locate the downloaded raw file in jobDir
+    if (signal.aborted || getJob(jobId)?.state === 'cancelled') return;
+
     const files = await fs.readdir(jobDir);
     const rawFile = files.find((f) => f.startsWith('raw_source.'));
     if (!rawFile) {
@@ -160,14 +296,12 @@ export async function processAudioJob(jobId) {
 
     const rawFilePath = path.join(jobDir, rawFile);
 
-    // 4. Update state to processing (transcoding)
     updateJob(jobId, { state: 'processing', progress_percent: 88, speed: null, eta: null });
 
     const safeBaseName = sanitizeFilename(job.title || `audio_${job.id.slice(0, 8)}`);
     const outputFilename = `${safeBaseName}.${job.format}`;
     const outputFilePath = path.join(jobDir, outputFilename);
 
-    // Check if source file already matches target format and quality is "best" (passthrough)
     const rawExt = path.extname(rawFile).replace('.', '').toLowerCase();
     const isPassthrough = rawExt === job.format && job.quality === 'best';
 
@@ -175,17 +309,17 @@ export async function processAudioJob(jobId) {
       format: job.format,
       bitrate: job.quality,
       passthrough: isPassthrough,
+      signal,
     });
 
-    // 5. Verify output file with FFprobe
+    if (signal.aborted || getJob(jobId)?.state === 'cancelled') return;
+
     const probe = await probeMedia(outputFilePath);
 
-    // 6. Delete temporary raw source file to save disk space
     try {
       await fs.unlink(rawFilePath);
     } catch (e) {}
 
-    // 7. Update job state to completed
     const completedJob = updateJob(jobId, {
       state: 'completed',
       progress_percent: 100,
@@ -199,11 +333,17 @@ export async function processAudioJob(jobId) {
     logger.info({ jobId, outputFilename, size: probe.size }, 'Audio job completed successfully');
     return completedJob;
   } catch (err) {
+    if (signal.aborted || getJob(jobId)?.state === 'cancelled') {
+      logger.info({ jobId }, 'Audio job execution stopped due to cancellation');
+      return;
+    }
     logger.error({ jobId, err: err.message }, 'Audio job failed');
     updateJob(jobId, {
       state: 'failed',
       error_message: err.message,
     });
+  } finally {
+    activeJobControllers.delete(jobId);
   }
 }
 
@@ -219,16 +359,19 @@ export async function processVideoJob(jobId) {
 
   logger.info({ jobId, url: job.url, quality: job.quality }, 'Processing video download job');
 
+  const controller = new AbortController();
+  activeJobControllers.set(jobId, controller);
+  const signal = controller.signal;
+
   try {
-    // 1. Create dedicated job directory
     const jobDir = await createJobDirectory(jobId);
 
-    // 2. Mark state as downloading
+    if (signal.aborted || getJob(jobId)?.state === 'cancelled') return;
+
     updateJob(jobId, { state: 'downloading', progress_percent: 5 });
 
-    // 3. Download best matching video + audio streams to MP4
     const rawTemplate = path.join(jobDir, 'raw_video.%(ext)s');
-    await downloadVideoStream(job.url, rawTemplate, { quality: job.quality }, (progress) => {
+    await downloadVideoStream(job.url, rawTemplate, { quality: job.quality, signal }, (progress) => {
       if (progress.percent) {
         updateJob(jobId, {
           progress_percent: Math.min(85, Math.round(progress.percent * 0.85)),
@@ -238,7 +381,8 @@ export async function processVideoJob(jobId) {
       }
     });
 
-    // Locate the downloaded video file in jobDir
+    if (signal.aborted || getJob(jobId)?.state === 'cancelled') return;
+
     const files = await fs.readdir(jobDir);
     const downloadedVideo = files.find((f) => f.startsWith('raw_video.'));
     if (!downloadedVideo) {
@@ -247,25 +391,23 @@ export async function processVideoJob(jobId) {
 
     const downloadedPath = path.join(jobDir, downloadedVideo);
 
-    // 4. Mark state as processing (remuxing for faststart streaming)
     updateJob(jobId, { state: 'processing', progress_percent: 88, speed: null, eta: null });
 
     const safeBaseName = sanitizeFilename(job.title || `video_${job.id.slice(0, 8)}`);
     const outputFilename = `${safeBaseName}.mp4`;
     const outputFilePath = path.join(jobDir, outputFilename);
 
-    // Run remux with faststart flags if not identical file path
     if (path.resolve(downloadedPath) !== path.resolve(outputFilePath)) {
-      await remuxToMp4(downloadedPath, outputFilePath);
+      await remuxToMp4(downloadedPath, outputFilePath, { signal });
       try {
         await fs.unlink(downloadedPath);
       } catch (e) {}
     }
 
-    // 5. Inspect final media file via FFprobe
+    if (signal.aborted || getJob(jobId)?.state === 'cancelled') return;
+
     const probe = await probeMedia(outputFilePath);
 
-    // 6. Update job state to completed
     const completedJob = updateJob(jobId, {
       state: 'completed',
       progress_percent: 100,
@@ -279,11 +421,17 @@ export async function processVideoJob(jobId) {
     logger.info({ jobId, outputFilename, size: probe.size, resolution: probe.resolution }, 'Video job completed successfully');
     return completedJob;
   } catch (err) {
+    if (signal.aborted || getJob(jobId)?.state === 'cancelled') {
+      logger.info({ jobId }, 'Video job execution stopped due to cancellation');
+      return;
+    }
     logger.error({ jobId, err: err.message }, 'Video job failed');
     updateJob(jobId, {
       state: 'failed',
       error_message: err.message,
     });
+  } finally {
+    activeJobControllers.delete(jobId);
   }
 }
 
@@ -293,7 +441,7 @@ export async function processVideoJob(jobId) {
  * Processes a single playlist item as an audio download.
  * Returns { success: boolean, outputFilename?, outputPath?, error? }.
  */
-async function processOneAudioItem(itemId, itemUrl, itemTitle, jobId, jobDir, format, quality) {
+async function processOneAudioItem(itemId, itemUrl, itemTitle, jobId, jobDir, format, quality, signal) {
   const safeBase = sanitizeFilename(itemTitle || `audio_${itemId.slice(0, 8)}`);
   try {
     updatePlaylistItem(itemId, { state: 'downloading' });
@@ -303,7 +451,9 @@ async function processOneAudioItem(itemId, itemUrl, itemTitle, jobId, jobDir, fo
       if (progress.percent) {
         updatePlaylistItem(itemId, { progress_percent: Math.min(85, Math.round(progress.percent * 0.85)) });
       }
-    });
+    }, { signal });
+
+    if (signal?.aborted) throw new Error('Cancelled');
 
     const dirFiles = await fs.readdir(jobDir);
     const rawFile = dirFiles.find((f) => f.startsWith(`item_${itemId}_raw.`));
@@ -318,7 +468,9 @@ async function processOneAudioItem(itemId, itemUrl, itemTitle, jobId, jobDir, fo
     const rawExt = path.extname(rawFile).replace('.', '').toLowerCase();
     const isPassthrough = rawExt === format && quality === 'best';
 
-    await convertAudio(rawFilePath, outputFilePath, { format, bitrate: quality, passthrough: isPassthrough });
+    await convertAudio(rawFilePath, outputFilePath, { format, bitrate: quality, passthrough: isPassthrough, signal });
+
+    if (signal?.aborted) throw new Error('Cancelled');
 
     const probe = await probeMedia(outputFilePath);
     try { await fs.unlink(rawFilePath); } catch (e) {}
@@ -341,17 +493,19 @@ async function processOneAudioItem(itemId, itemUrl, itemTitle, jobId, jobDir, fo
  * Processes a single playlist item as a video download.
  * Returns { success: boolean, outputFilename?, outputPath?, error? }.
  */
-async function processOneVideoItem(itemId, itemUrl, itemTitle, jobId, jobDir, quality) {
+async function processOneVideoItem(itemId, itemUrl, itemTitle, jobId, jobDir, quality, signal) {
   const safeBase = sanitizeFilename(itemTitle || `video_${itemId.slice(0, 8)}`);
   try {
     updatePlaylistItem(itemId, { state: 'downloading' });
 
     const rawTemplate = path.join(jobDir, `item_${itemId}_raw.%(ext)s`);
-    await downloadVideoStream(itemUrl, rawTemplate, { quality }, (progress) => {
+    await downloadVideoStream(itemUrl, rawTemplate, { quality, signal }, (progress) => {
       if (progress.percent) {
         updatePlaylistItem(itemId, { progress_percent: Math.min(85, Math.round(progress.percent * 0.85)) });
       }
     });
+
+    if (signal?.aborted) throw new Error('Cancelled');
 
     const dirFiles = await fs.readdir(jobDir);
     const rawFile = dirFiles.find((f) => f.startsWith(`item_${itemId}_raw.`));
@@ -365,9 +519,11 @@ async function processOneVideoItem(itemId, itemUrl, itemTitle, jobId, jobDir, qu
     const outputFilePath = path.join(jobDir, outputFilename);
 
     if (path.resolve(rawFilePath) !== path.resolve(outputFilePath)) {
-      await remuxToMp4(rawFilePath, outputFilePath);
+      await remuxToMp4(rawFilePath, outputFilePath, { signal });
       try { await fs.unlink(rawFilePath); } catch (e) {}
     }
+
+    if (signal?.aborted) throw new Error('Cancelled');
 
     const probe = await probeMedia(outputFilePath);
 
@@ -398,8 +554,15 @@ export async function processPlaylistAudioJob(jobId) {
 
   logger.info({ jobId, url: job.url }, 'Processing playlist audio job');
 
+  const controller = new AbortController();
+  activeJobControllers.set(jobId, controller);
+  const signal = controller.signal;
+
   try {
     const jobDir = await createJobDirectory(jobId);
+
+    if (signal.aborted || getJob(jobId)?.state === 'cancelled') return;
+
     updateJob(jobId, { state: 'downloading', progress_percent: 2 });
 
     // Inspect playlist to enumerate entries
@@ -407,6 +570,8 @@ export async function processPlaylistAudioJob(jobId) {
     if (!media.isPlaylist) {
       throw new Error('URL does not resolve to a playlist');
     }
+
+    if (signal.aborted || getJob(jobId)?.state === 'cancelled') return;
 
     const entries = media.entries || [];
     const totalItems = entries.length;
@@ -436,7 +601,7 @@ export async function processPlaylistAudioJob(jobId) {
 
       // Check for cancellation signal
       const currentJob = getJob(jobId);
-      if (currentJob?.state === 'cancelled') {
+      if (signal.aborted || currentJob?.state === 'cancelled') {
         logger.info({ jobId }, 'Playlist audio job cancelled during item iteration');
         return;
       }
@@ -448,7 +613,7 @@ export async function processPlaylistAudioJob(jobId) {
 
       const result = await processOneAudioItem(
         itemId, entry.url, entry.title, jobId, jobDir,
-        job.format, job.quality
+        job.format, job.quality, signal
       );
 
       if (result.success) {
@@ -464,6 +629,8 @@ export async function processPlaylistAudioJob(jobId) {
         failed_item_count: failedCount,
       });
     }
+
+    if (signal.aborted || getJob(jobId)?.state === 'cancelled') return;
 
     // Determine final job state
     const finalState =
@@ -496,8 +663,14 @@ export async function processPlaylistAudioJob(jobId) {
     );
     return completedJob;
   } catch (err) {
+    if (signal.aborted || getJob(jobId)?.state === 'cancelled') {
+      logger.info({ jobId }, 'Playlist audio job halted due to cancellation');
+      return;
+    }
     logger.error({ jobId, err: err.message }, 'Playlist audio job failed');
     updateJob(jobId, { state: 'failed', error_message: err.message });
+  } finally {
+    activeJobControllers.delete(jobId);
   }
 }
 
@@ -514,8 +687,15 @@ export async function processPlaylistVideoJob(jobId) {
 
   logger.info({ jobId, url: job.url }, 'Processing playlist video job');
 
+  const controller = new AbortController();
+  activeJobControllers.set(jobId, controller);
+  const signal = controller.signal;
+
   try {
     const jobDir = await createJobDirectory(jobId);
+
+    if (signal.aborted || getJob(jobId)?.state === 'cancelled') return;
+
     updateJob(jobId, { state: 'downloading', progress_percent: 2 });
 
     // Inspect playlist to enumerate entries
@@ -523,6 +703,8 @@ export async function processPlaylistVideoJob(jobId) {
     if (!media.isPlaylist) {
       throw new Error('URL does not resolve to a playlist');
     }
+
+    if (signal.aborted || getJob(jobId)?.state === 'cancelled') return;
 
     const entries = media.entries || [];
     const totalItems = entries.length;
@@ -552,7 +734,7 @@ export async function processPlaylistVideoJob(jobId) {
 
       // Check for cancellation signal
       const currentJob = getJob(jobId);
-      if (currentJob?.state === 'cancelled') {
+      if (signal.aborted || currentJob?.state === 'cancelled') {
         logger.info({ jobId }, 'Playlist video job cancelled during item iteration');
         return;
       }
@@ -563,7 +745,7 @@ export async function processPlaylistVideoJob(jobId) {
       });
 
       const result = await processOneVideoItem(
-        itemId, entry.url, entry.title, jobId, jobDir, job.quality
+        itemId, entry.url, entry.title, jobId, jobDir, job.quality, signal
       );
 
       if (result.success) {
@@ -579,6 +761,8 @@ export async function processPlaylistVideoJob(jobId) {
         failed_item_count: failedCount,
       });
     }
+
+    if (signal.aborted || getJob(jobId)?.state === 'cancelled') return;
 
     // Determine final job state
     const finalState =
@@ -611,7 +795,13 @@ export async function processPlaylistVideoJob(jobId) {
     );
     return completedJob;
   } catch (err) {
+    if (signal.aborted || getJob(jobId)?.state === 'cancelled') {
+      logger.info({ jobId }, 'Playlist video job halted due to cancellation');
+      return;
+    }
     logger.error({ jobId, err: err.message }, 'Playlist video job failed');
     updateJob(jobId, { state: 'failed', error_message: err.message });
+  } finally {
+    activeJobControllers.delete(jobId);
   }
 }

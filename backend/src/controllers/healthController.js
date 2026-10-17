@@ -2,8 +2,20 @@ import { spawn } from 'node:child_process';
 import { getEnv } from '../config/env.js';
 import { getDatabase } from '../database/index.js';
 
+const binaryCache = new Map();
+
 function execBinaryVersion(binaryPath, args) {
-  return new Promise((resolve) => {
+  const cacheKey = `${binaryPath}:${args.join(' ')}`;
+  const cached = binaryCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < 60000) {
+    return Promise.resolve(cached.result);
+  }
+
+  return new Promise((origResolve) => {
+    const resolve = (result) => {
+      binaryCache.set(cacheKey, { timestamp: Date.now(), result });
+      origResolve(result);
+    };
     let stdout = '';
     let stderr = '';
     let processExited = false;
@@ -18,13 +30,14 @@ function execBinaryVersion(binaryPath, args) {
           try {
             child.kill();
           } catch (e) {}
-          resolve({
+          const res = {
             available: false,
             version: null,
-            error: 'Process timed out after 4000ms',
-          });
+            error: 'Process timed out after 10000ms',
+          };
+          resolve(res);
         }
-      }, 4000);
+      }, 10000);
 
       child.stdout?.on('data', (data) => {
         stdout += data.toString();

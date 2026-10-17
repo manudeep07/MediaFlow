@@ -71,6 +71,30 @@ export async function deleteJobApi(jobId) {
   return data;
 }
 
+export async function cancelJobApi(jobId) {
+  const response = await fetch(`${API_BASE}/downloads/${jobId}/cancel`, {
+    method: 'POST',
+    headers: { Accept: 'application/json' },
+  });
+  const data = await response.json();
+  if (!response.ok || !data.success) {
+    throw new Error(data?.error?.message || 'Failed to cancel job');
+  }
+  return data.data;
+}
+
+export async function retryJobApi(jobId) {
+  const response = await fetch(`${API_BASE}/downloads/${jobId}/retry`, {
+    method: 'POST',
+    headers: { Accept: 'application/json' },
+  });
+  const data = await response.json();
+  if (!response.ok || !data.success) {
+    throw new Error(data?.error?.message || 'Failed to retry job');
+  }
+  return data.data;
+}
+
 export async function getPlaylistItemsApi(jobId) {
   const response = await fetch(`${API_BASE}/downloads/${jobId}/items`, {
     headers: { Accept: 'application/json' },

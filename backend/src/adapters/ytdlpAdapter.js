@@ -187,7 +187,7 @@ export async function inspectMedia(url) {
   });
 }
 
-export function downloadAudioStream(url, tempOutputPath, onProgress) {
+export function downloadAudioStream(url, tempOutputPath, onProgress, options = {}) {
   const env = getEnv();
   const ytdlpPath = env.YT_DLP_PATH;
 
@@ -209,7 +209,7 @@ export function downloadAudioStream(url, tempOutputPath, onProgress) {
     let stderr = '';
     let exited = false;
 
-    const child = spawn(ytdlpPath, args, { windowsHide: true });
+    const child = spawn(ytdlpPath, args, { windowsHide: true, signal: options.signal });
 
     child.stdout.on('data', (chunk) => {
       const lines = chunk.toString().split('\n');
@@ -291,7 +291,7 @@ export function downloadVideoStream(url, tempOutputPath, options = {}, onProgres
     let stderr = '';
     let exited = false;
 
-    const child = spawn(ytdlpPath, args, { windowsHide: true });
+    const child = spawn(ytdlpPath, args, { windowsHide: true, signal: options.signal });
 
     child.stdout.on('data', (chunk) => {
       const lines = chunk.toString().split('\n');
