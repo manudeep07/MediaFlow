@@ -1,0 +1,14 @@
+{
+  "name": "mediaflow",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "MediaFlow — Local-first media downloading and conversion application",
+  "scripts": {
+    "dev": "node dev.js",
+    "dev:backend": "npm --prefix backend run dev",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "test:backend": "npm --prefix backend test",
+    "test": "npm --prefix backend test"
+  }
+}
